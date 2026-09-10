@@ -1,0 +1,6 @@
+# dsh bundle layer: mount the opencode-models plugin (dsh/index.js via the
+# package root export). The row name is the package's own name, resolved by
+# the loader to this package's `dsh.bundle.patch`.
+- insert:
+    - id: opencode-models
+      name: 'dsh-opencode-models'
