@@ -156,11 +156,24 @@ llm-pi-ai:
 
 ## 兼容性
 
-- dsh ≥ 0.1.0-rc.7（web profile；在 0.1.2-alpha.x 上开发验证）
+- dsh ≥ 0.1.0-rc.7（web profile；在 0.1.2-alpha.x 上开发验证，0.2.0-rc.2 上修复验证）
 - 零构建、零运行时依赖（宿主与浏览器端均为 node/DOM 内置能力）
+- 读配置走 `settings.describe()`：dsh 0.1.x 的 `settings.get(ns)` 在 **0.2.0 已被移除**（v0.2.1 起改用 `describe().find(ns).value`，新旧版本语义等价，双向兼容）
 - 已验证的场景：模型上新自动补齐、下线模型自动移除、视觉模型自动标注、5xx 故障不误删
 - **已知限制**：服务端出现 catalog 未收录的模型、且路由未声明 `api` 时，这部分模型不会被写入（会列在结果里）。本插件不会擅自替你声明 `api`（见上文「刷新失败 / 模型未被纳入」一节）
 - 思考强度：同步的模型带 `reasoningEfforts` 声明，WebUI 出现思考强度选择器（关闭 / Minimal / Low / Medium / High / Max）。选择器停在"关闭"时完全不发送思考参数。少数模型的上游拒绝 Max（qwen3.7 系列、grok-4.5、gpt-5.6-luna、minimax-m2.7、mimo-v2.5-pro 已实测剔除，只到 High）；不想给某个模型开，把它的 `reasoningEfforts` 手动设为 `false`，同步会保留你的设置
+
+## 升级到 dsh 0.2.0 后刷新报 `ctx.settings.get is not a function`
+
+dsh 0.2.0 移除了 `settings` 服务的 `get(ns)` 方法（0.1.x 有，返回该命名空间的解析值），插件 v0.2.0 及更早版本因此在该版本上**完全无法读取配置**，点刷新立即失败：
+
+```
+刷新失败：ctx.settings.get is not a function
+```
+
+**v0.2.1 已修复**：改用 `settings.describe().find(ns).value`。这个方法在 0.1.2 起的每个版本都存在，返回的 `value` 与旧 `get()` 返回的解析值相同，所以同一个调用在新旧 dsh 上都能用。
+
+修复后需要**重启 dsh**（宿主端模块在启动时加载，热重载不会重新执行已缓存的模块），再刷新页面。
 
 ## License
 

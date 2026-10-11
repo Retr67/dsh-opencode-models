@@ -213,7 +213,20 @@ export function apply(ctx, config = {}) {
     try {
       // 1. Route configuration.
       setStatus('listing', '读取 provider 配置…')
-      const section = ctx.settings.get(NS)
+      // Read the llm-pi-ai route through describe(), NOT get().
+      //
+      // dsh 0.1.x exposed settings.get(ns) (returning the namespace's resolved
+      // value); 0.2.0 removed it — SettingsForms now exposes only configure /
+      // writable / documentPath / prepareDocument / describe / update / replace /
+      // mutate. Calling get() on 0.2.0 throws "ctx.settings.get is not a
+      // function" before a single probe runs.
+      //
+      // describe() exists on BOTH (0.1.2 onward) and its per-namespace `value`
+      // is the same resolved section get() used to return, so this one call is
+      // forward- and backward-compatible. It is also the path the settings
+      // service itself uses internally, and what dsh's own session-controller
+      // uses to read another plugin's config.
+      const section = ctx.settings.describe?.().find((row) => row.ns === NS)?.value
       const route = section?.providers?.[provider]
       if (!route || typeof route.baseURL !== 'string') {
         throw new Error(`llm-pi-ai settings 里没有 ${provider} 路由（或缺少 baseURL）`)
