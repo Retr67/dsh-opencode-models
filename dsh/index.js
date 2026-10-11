@@ -31,9 +31,16 @@
 export const name = 'dsh-opencode-models'
 export const inject = ['settings', 'credentials']
 
-export const Config = null
+// 0.2.0: harness SettingsForms 对 Config 做 'toJSON' in schema' 判断，
+// null 会炸掉整个设置表单枚举（"加载提供商目录失败"）；undefined = 无 schema。
+export const Config = undefined
 
 const NS = 'llm-pi-ai'
+
+// The wire protocol every probe in this file speaks (POST {baseURL}/chat/completions).
+// Named only in the repair hint for a route that declares no `api` — the plugin
+// never writes it into settings; see step 6 for why that is the user's call.
+const PROBE_API = 'openai-completions'
 
 /** 1x1 transparent PNG used for the vision probe. */
 const PING_PNG =
@@ -324,8 +331,17 @@ export function apply(ctx, config = {}) {
               // preserves every field the entry already sets.
             }
         // Vision comes from the probe (authoritative for this server).
-        if (model.input) delete model.input
-        if (v.vision) model.input = ['text', 'image']
+        // Only touch the key when the value actually changes: `delete` followed
+        // by an unconditional re-add moves `input` to the end of the object, and
+        // the change check below compares JSON.stringify, which is key-order
+        // sensitive. Re-adding an unchanged value would therefore report a
+        // difference that is not one — a spurious settings write on a sync that
+        // changed nothing, which is exactly what "无变化不写" promises not to do.
+        const desiredInput = v.vision ? ['text', 'image'] : undefined
+        if (JSON.stringify(model.input) !== JSON.stringify(desiredInput)) {
+          if (model.input) delete model.input
+          if (desiredInput) model.input = desiredInput
+        }
         // Reasoning: the gateway accepts reasoning_effort on every model probed
         // (2026-09, OpenAI-completions wire), and dsh omits the parameter
         // entirely while the selector sits on 'off'. The ladder offers
@@ -352,9 +368,40 @@ export function apply(ctx, config = {}) {
       const changed = JSON.stringify(currentModels) !== JSON.stringify(nextModels)
       if (changed) {
         setStatus('writing', `写入 settings（${nextModels.length} 个模型）…`)
-        await ctx.settings.mutate(NS, [
-          { op: 'set', path: ['providers', provider, 'models'], value: nextModels },
-        ])
+        try {
+          await ctx.settings.mutate(NS, [
+            { op: 'set', path: ['providers', provider, 'models'], value: nextModels },
+          ])
+        } catch (error) {
+          const message = String(error && error.message ? error.message : error)
+          // A route that names no `api` can only serve models the installed
+          // catalog describes: the harness resolves `api ?? catalog entry's api
+          // ?? the one protocol every catalog model agrees on`, and a catalog
+          // spanning several protocols (opencode-go ships anthropic-messages,
+          // openai-completions and openai-responses) has no such shared answer.
+          // So the first time the server serves a model the catalog has not
+          // caught up with, the entire write is refused — issue #1.
+          //
+          // The plugin does not declare that protocol for you. On a catalog
+          // route an explicit `api` switches provider construction away from
+          // the catalog provider, which is what wraps requests in this
+          // gateway's per-conversation `x-opencode-session` header — declaring
+          // it here would fix the sync and silently break every chat request
+          // for a route that relies on that wrapper. It is the user's call, so
+          // this reports the refusal with the exact repair instead.
+          if (!/needs an api/i.test(message)) throw error
+          throw new Error(
+            `${message}\n\n` +
+              `原因：服务端提供了 dsh 内置 catalog 尚未收录的模型，而路由 ${provider} 没有声明 wire 协议，` +
+              `dsh 拒绝写入整份列表。\n` +
+              `修法：在该路由下加一行 api（本插件的探测走 POST {baseURL}/chat/completions，所以通常是 openai-completions）：\n\n` +
+              `  llm-pi-ai:\n    providers:\n      ${provider}:\n        api: ${PROBE_API}\n\n` +
+              `注意：catalog 路由一旦显式声明 api，dsh 会改用协议实现而非 catalog provider 构造该路由，` +
+              `随之不再自动注入 x-opencode-session 请求头。若你的网关要求该头（如 OpenCode Go），` +
+              `请同时在路由里显式配置：\n\n` +
+              `        headers:\n          x-opencode-session: <你的会话标识>\n`,
+          )
+        }
       } else {
         setStatus('writing', '无需写入（列表无变化）')
       }
