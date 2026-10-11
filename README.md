@@ -65,9 +65,46 @@ npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/Retr67/dsh-o
 
 > 探测请求与列表请求会携带该 provider 路由配置里的 `headers`（llm-pi-ai 路由可配 `headers: { ... }`）。部分聚合网关（如 OpenCode Go）要求 `x-opencode-session` 请求头——确保它在你的路由 headers 里，否则探测会被网关判为拒绝。
 
-## 刷新失败：`model "xxx" needs an api`
+## 刷新失败 / 模型未被纳入：`model "xxx" needs an api`
 
-如果刷新报出这样的错：
+服务端会先于 catalog 上新，所以同步时**可能有一部分模型写不进去**。这是设计使然，不是故障。
+
+### 为什么
+
+dsh 给一个模型定 wire 协议时按这个顺序解析：
+
+```
+路由的 api  →  catalog 里该模型的 api  →  该路由 catalog 唯一一致的协议
+```
+
+`opencode-go` 的 catalog 同时包含三种协议（`anthropic-messages` / `openai-completions` / `openai-responses`），所以**第三条永远没有值**。于是 catalog 不认识的模型无从定协议。
+
+### 插件现在的行为（不再全盘失败）
+
+| 情况 | 行为 |
+|---|---|
+| 路由**已声明** `api` | 全部模型照常同步（api 能解析不认识的模型） |
+| 路由**未声明** `api`，但有 catalog 认识的模型 | **认识的照常写入**；不认识的列在「未纳入（catalog 未收录）」里，不写入 |
+| 路由**未声明** `api`，且一个认识的都没有 | 拒绝写入并报错（写空列表会把你已配置的模型丢回 catalog 默认值） |
+
+也就是说：**同步能推进多少就推进多少**，不会再因为一个新模型导致整份列表都写不进去。未纳入的模型会明确列出来，而不是悄悄丢掉。
+
+### 想让那部分模型也纳入
+
+在路由下加一行 `api`：
+
+```yaml
+llm-pi-ai:
+  providers:
+    opencode-go:
+      api: openai-completions     # ← 加这一行
+      baseURL: https://opencode.ai/zen/go/v1
+      apiKeyEnv: OPENCODE_GO_API_KEY
+```
+
+加了之后刷新，未收录的模型也会被写入。
+
+如果你看到过这样的报错：
 
 ```
 刷新失败：llm-pi-ai: provider "opencode-go" model "minimax-m2.5" needs an api;
@@ -122,7 +159,7 @@ llm-pi-ai:
 - dsh ≥ 0.1.0-rc.7（web profile；在 0.1.2-alpha.x 上开发验证）
 - 零构建、零运行时依赖（宿主与浏览器端均为 node/DOM 内置能力）
 - 已验证的场景：模型上新自动补齐、下线模型自动移除、视觉模型自动标注、5xx 故障不误删
-- **已知限制**：服务端出现 catalog 未收录的模型、且路由未声明 `api` 时，dsh 会拒绝整份写入——本插件会给出可操作的报错（见上文「刷新失败」一节），不会擅自替你改路由配置
+- **已知限制**：服务端出现 catalog 未收录的模型、且路由未声明 `api` 时，这部分模型不会被写入（会列在结果里）。本插件不会擅自替你声明 `api`（见上文「刷新失败 / 模型未被纳入」一节）
 - 思考强度：同步的模型带 `reasoningEfforts` 声明，WebUI 出现思考强度选择器（关闭 / Minimal / Low / Medium / High / Max）。选择器停在"关闭"时完全不发送思考参数。少数模型的上游拒绝 Max（qwen3.7 系列、grok-4.5、gpt-5.6-luna、minimax-m2.7、mimo-v2.5-pro 已实测剔除，只到 High）；不想给某个模型开，把它的 `reasoningEfforts` 手动设为 `false`，同步会保留你的设置
 
 ## License

@@ -365,12 +365,50 @@ export function apply(ctx, config = {}) {
       // 6. Write back — whenever merged content differs from what is on disk
       // (additions, removals, or newly declared fields like reasoningEfforts),
       // not only when the id set changed.
-      const changed = JSON.stringify(currentModels) !== JSON.stringify(nextModels)
+      // Which of these can this route actually serve? A route that names no
+      // `api` can only serve models the installed catalog describes: the
+      // harness resolves `api ?? catalog entry's api ?? the one protocol every
+      // catalog model agrees on`, and a catalog spanning several protocols
+      // (opencode-go ships anthropic-messages, openai-completions and
+      // openai-responses) has no such shared answer. One server-side addition
+      // the catalog has not caught up with therefore used to sink the ENTIRE
+      // list — issue #1. Catalog-known models are now written as usual and the
+      // rest are reported, so a sync is no longer all-or-nothing.
+      let catalogIds = null
+      try {
+        const llm = ctx.get?.('llm')
+        // A catalog route answers this from the installed catalog: no network.
+        if (llm && typeof llm.discoverModels === 'function') {
+          const rows = await llm.discoverModels(NS, { provider })
+          catalogIds = new Set((rows || []).map((row) => row && row.id).filter((id) => typeof id === 'string'))
+        }
+      } catch { catalogIds = null } // unknown: fall back to writing everything
+
+      const undescribed = catalogIds !== null && route.api === undefined
+        ? nextModels.filter((model) => !catalogIds.has(model.id))
+        : []
+      const writable = undescribed.length > 0
+        ? nextModels.filter((model) => catalogIds.has(model.id))
+        : nextModels
+
+      const changed = JSON.stringify(currentModels) !== JSON.stringify(writable)
+      if (changed && writable.length === 0) {
+        // Nothing here is servable; writing an empty list would hand the route
+        // back to the catalog defaults and drop the user's configured models.
+        throw new Error(
+          `服务端 ${listed.length} 个模型里没有一个被 dsh 内置 catalog 收录，而路由 ${provider} 没有声明 wire 协议；` +
+            `写入空列表会把你已配置的模型丢回 catalog 默认值，因此本次未写入。\n` +
+            `修法：在该路由下加一行 api（本插件的探测走 POST {baseURL}/chat/completions，所以通常是 openai-completions）：\n\n` +
+            `  llm-pi-ai:\n    providers:\n      ${provider}:\n        api: ${PROBE_API}\n\n` +
+            `注意：catalog 路由一旦显式声明 api，dsh 会改用协议实现而非 catalog provider 构造该路由，` +
+            `随之不再自动注入 x-opencode-session 请求头。若你的网关要求该头（如 OpenCode Go），请同时在路由里显式配置 headers。`,
+        )
+      }
       if (changed) {
-        setStatus('writing', `写入 settings（${nextModels.length} 个模型）…`)
+        setStatus('writing', `写入 settings（${writable.length} 个模型）…`)
         try {
           await ctx.settings.mutate(NS, [
-            { op: 'set', path: ['providers', provider, 'models'], value: nextModels },
+            { op: 'set', path: ['providers', provider, 'models'], value: writable },
           ])
         } catch (error) {
           const message = String(error && error.message ? error.message : error)
@@ -416,6 +454,14 @@ export function apply(ctx, config = {}) {
         kept,
         removed,
         unavailable,
+        // Models the server offers but this route cannot serve, because the
+        // installed catalog does not describe them and the route names no
+        // protocol. Surfaced rather than dropped silently: the sync still
+        // lands everything else, and the user can admit these by adding `api`.
+        skipped: undescribed.map((model) => ({
+          id: model.id,
+          reason: 'catalog 未收录，且路由未声明 api',
+        })),
         written: changed,
       }
     } catch (error) {

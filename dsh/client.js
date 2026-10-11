@@ -107,6 +107,7 @@ window.__ModuleLoader__.load({
         h(ResultGroup, { title: '保留', rows: result.kept, tone: 'keep', tag: 'KEEP', key: 'g-keep' }),
         h(ResultGroup, { title: '移除', rows: result.removed, tone: 'remove', tag: 'REMOVE', key: 'g-remove' }),
         h(ResultGroup, { title: '服务端拒绝', rows: result.unavailable, tone: 'skip', tag: 'SKIP', key: 'g-skip' }),
+        h(ResultGroup, { title: '未纳入（catalog 未收录）', rows: result.skipped, tone: 'skip', tag: 'NEEDS API', key: 'g-skipped' }),
       ]
     }
 
