@@ -36,6 +36,14 @@ export const inject = ['settings', 'credentials']
 export const Config = undefined
 
 const NS = 'llm-pi-ai'
+// The namespace llm-pi-ai is registered under its ENTRY ID, which is
+// `ctx.fiber.entry?.options.id ?? 'llm-pi-ai'` on the adapter's side
+// (llm-pi-ai/src/index.ts) and `entry.options.id` on the settings side.
+// dsh's bundle manifest normally pins it to `llm-pi-ai`, but the loader falls
+// back to a generated id when a row omits one, so a hardcoded NS can silently
+// miss the section (false "no route") and make discoverModels throw
+// NO_DISCOVERY — which would put back the all-or-nothing failure of issue #1.
+// Resolve it from the live entries instead, and only fall back to the constant.
 
 // The wire protocol every probe in this file speaks (POST {baseURL}/chat/completions).
 // Named only in the repair hint for a route that declares no `api` — the plugin
@@ -120,8 +128,9 @@ export function apply(ctx, config = {}) {
 
   /** List the server's model ids. Returns [{ id, raw }]. */
   async function listModels(baseURL, apiKey, extraHeaders) {
+    const url = modelsUrl(baseURL)
     const response = await fetchWithRetry(
-      modelsUrl(baseURL),
+      url,
       {
         headers: {
           ...(extraHeaders || {}),
@@ -132,14 +141,43 @@ export function apply(ctx, config = {}) {
       3,
       timeoutMs,
     )
+    // Read the body once, as text: a refusal body carries the reason, and a
+    // gateway that answers 200 with an HTML error page would otherwise surface
+    // as an opaque JSON parse error.
+    const text = await response.text().catch(() => '')
     if (!response.ok) {
-      throw new Error('GET /models answered ' + response.status)
+      const snippet = text.trim().slice(0, 200)
+      throw new Error(
+        `GET ${url} 返回 ${response.status}${snippet ? '：' + snippet : ''}\n` +
+          `请检查该路由的 baseURL 是否正确、apiKeyEnv 指向的凭据是否有效。`,
+      )
     }
-    const body = await response.json()
-    const rows = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : []
+    let body
+    try {
+      body = JSON.parse(text)
+    } catch {
+      throw new Error(
+        `GET ${url} 返回的不是 JSON（前 200 字符）：${text.trim().slice(0, 200)}`,
+      )
+    }
+    // OpenAI-compatible servers answer { data: [...] }; some aggregators use
+    // { models: [...] } instead. Accept both, plus a bare array.
+    const container = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.data)
+        ? body.data
+        : Array.isArray(body?.models)
+          ? body.models
+          : undefined
+    if (container === undefined) {
+      const shape = body && typeof body === 'object' ? Object.keys(body).slice(0, 8).join(', ') : typeof body
+      throw new Error(
+        `GET ${url} 的响应里找不到模型数组（期望 data / models / 顶层数组，实际字段：${shape}）`,
+      )
+    }
     const seen = new Set()
     const listed = []
-    for (const row of rows) {
+    for (const row of container) {
       const id = typeof row === 'string' ? row : row && row.id
       if (typeof id !== 'string' || id.length === 0 || seen.has(id)) continue
       seen.add(id)
@@ -205,6 +243,38 @@ export function apply(ctx, config = {}) {
     return 'unknown'
   }
 
+  /**
+   * The settings namespace llm-pi-ai is registered under its ENTRY ID, which is
+   * `ctx.fiber.entry?.options.id ?? 'llm-pi-ai'` on the adapter's side and
+   * `entry.options.id` on the settings side. dsh's bundle manifest normally pins
+   * it to `llm-pi-ai`, but the loader falls back to a generated id when a row
+   * omits one. A hardcoded NS would then miss the section (false "no route") and
+   * make discoverModels throw NO_DISCOVERY, silently putting back the
+   * all-or-nothing failure of issue #1. So find the live namespace, and only
+   * fall back to the constant when nothing is visible.
+   * @param rows - namespaces reported by settings.describe().
+   * @returns the namespace to read and to pass to discoverModels.
+   */
+  function settingsNamespace(rows) {
+    if (!Array.isArray(rows)) return NS
+    const exact = rows.find((row) => row && row.ns === NS)
+    if (exact) return NS
+    // Otherwise recognise the adapter's section by what this plugin actually
+    // needs from it: a providers dict that carries the target route. That is
+    // precise enough that another plugin declaring an unrelated `providers`
+    // field cannot be mistaken for it.
+    const carriesRoute = rows.find((row) => {
+      const providers = row && row.value && row.value.providers
+      return providers && typeof providers === 'object' && provider in providers
+    })
+    if (carriesRoute) return carriesRoute.ns
+    const shaped = rows.find((row) => {
+      const value = row && row.value
+      return value && typeof value === 'object' && 'providers' in value
+    })
+    return shaped ? shaped.ns : NS
+  }
+
   async function run() {
     state.startedAt = Date.now()
     state.finishedAt = null
@@ -226,7 +296,9 @@ export function apply(ctx, config = {}) {
       // forward- and backward-compatible. It is also the path the settings
       // service itself uses internally, and what dsh's own session-controller
       // uses to read another plugin's config.
-      const section = ctx.settings.describe?.().find((row) => row.ns === NS)?.value
+      const described = ctx.settings.describe?.()
+      const ns = settingsNamespace(described)
+      const section = described?.find((row) => row.ns === ns)?.value
       const route = section?.providers?.[provider]
       if (!route || typeof route.baseURL !== 'string') {
         throw new Error(`llm-pi-ai settings 里没有 ${provider} 路由（或缺少 baseURL）`)
@@ -302,6 +374,25 @@ export function apply(ctx, config = {}) {
         )
       }
 
+      // 4b. Guard against a systemic cull. Losing most of the CONFIGURED models
+      // that the server still advertises — and losing them all to HTTP
+      // rejections — looks like a systemic fault (expired key, quota, or a
+      // header the gateway newly requires) rather than a real cull. On
+      // 2026-09-08 a missing header made the gateway 400 a subset and the sync
+      // deleted 8 working models. Models the server stopped listing are a
+      // genuine removal and are deliberately not counted here, so "下线模型自动
+      // 移除" keeps working. Rescue by KEEPING them rather than aborting: the
+      // rest of the sync still lands, and nothing is destroyed.
+      const advertised = new Set(listed.map((row) => row.id))
+      const configuredAdvertised = currentModels.filter((model) => model && advertised.has(model.id))
+      const droppedByProbe = configuredAdvertised.filter((model) => {
+        const v = verdict.get(model.id)
+        return v !== undefined && !v.available && v.note !== 'flaky' && v.note !== 'unknown'
+      })
+      const systemicCull = droppedByProbe.length >= 3
+        && droppedByProbe.length * 2 >= configuredAdvertised.length
+      const rescued = new Set(systemicCull ? droppedByProbe.map((model) => model.id) : [])
+
       // 5. Merge: server order, probe-filtered, hand metadata preserved.
       const nextModels = []
       const added = []
@@ -320,9 +411,11 @@ export function apply(ctx, config = {}) {
                   ? '5xx 暂时故障（保留）'
                   : '无法判定（保留）' + (v.message ? '：' + String(v.message).slice(0, 120) : '')
           const entry = byId.get(row.id)
-          if (entry && (v.note === 'flaky' || v.note === 'unknown')) {
+          if (entry && (v.note === 'flaky' || v.note === 'unknown' || rescued.has(row.id))) {
             // Keep previously configured entries on flaky/unknown — do not
-            // delete a working model because one probe hiccuped.
+            // delete a working model because one probe hiccuped. Entries in
+            // `rescued` are kept because the rejection pattern looked systemic
+            // (see 4b) rather than like a real cull.
             nextModels.push(entry)
             kept.push(row.id)
           } else {
@@ -392,7 +485,7 @@ export function apply(ctx, config = {}) {
         const llm = ctx.get?.('llm')
         // A catalog route answers this from the installed catalog: no network.
         if (llm && typeof llm.discoverModels === 'function') {
-          const rows = await llm.discoverModels(NS, { provider })
+          const rows = await llm.discoverModels(ns, { provider })
           catalogIds = new Set((rows || []).map((row) => row && row.id).filter((id) => typeof id === 'string'))
         }
       } catch { catalogIds = null } // unknown: fall back to writing everything
@@ -406,21 +499,31 @@ export function apply(ctx, config = {}) {
 
       const changed = JSON.stringify(currentModels) !== JSON.stringify(writable)
       if (changed && writable.length === 0) {
-        // Nothing here is servable; writing an empty list would hand the route
-        // back to the catalog defaults and drop the user's configured models.
+        // Nothing survived; writing an empty list would hand the route back to
+        // the catalog defaults and drop the user's configured models. Refuse —
+        // and name the ACTUAL cause. "every model is catalog-unknown" and
+        // "every probe failed" need opposite fixes, so blaming the wrong one
+        // sends the reader down the wrong path.
+        const nothingProbed = nextModels.length === 0
         throw new Error(
-          `服务端 ${listed.length} 个模型里没有一个被 dsh 内置 catalog 收录，而路由 ${provider} 没有声明 wire 协议；` +
+          `服务端 ${listed.length} 个模型，没有一个能写入${nothingProbed ? '：全部未通过探测' : ''}。\n` +
             `写入空列表会把你已配置的模型丢回 catalog 默认值，因此本次未写入。\n` +
-            `修法：在该路由下加一行 api（本插件的探测走 POST {baseURL}/chat/completions，所以通常是 openai-completions）：\n\n` +
-            `  llm-pi-ai:\n    providers:\n      ${provider}:\n        api: ${PROBE_API}\n\n` +
-            `注意：catalog 路由一旦显式声明 api，dsh 会改用协议实现而非 catalog provider 构造该路由，` +
-            `随之不再自动注入 x-opencode-session 请求头。若你的网关要求该头（如 OpenCode Go），请同时在路由里显式配置 headers。`,
+            (nothingProbed
+              ? `常见原因：API key 无效或已过期（401）、订阅/配额失效（403）、baseURL 写错、` +
+                `或网关要求额外请求头（如 x-opencode-session，需在路由的 headers 里配置）。\n` +
+                `结果里的「服务端拒绝」分组列出了每个模型被拒的原因。`
+              : `${undescribed.length} 个可用模型未被 dsh 内置 catalog 收录，而路由 ${provider} 没有声明 wire 协议，` +
+                `dsh 无法为它们定协议。\n` +
+                `修法：在该路由下加一行 api（本插件的探测走 POST {baseURL}/chat/completions，所以通常是 openai-completions）：\n\n` +
+                `  llm-pi-ai:\n    providers:\n      ${provider}:\n        api: ${PROBE_API}\n\n` +
+                `注意：catalog 路由一旦显式声明 api，dsh 会改用协议实现而非 catalog provider 构造该路由，` +
+                `随之不再自动注入 x-opencode-session 请求头。若你的网关要求该头（如 OpenCode Go），请同时在路由里显式配置 headers。`),
         )
       }
       if (changed) {
         setStatus('writing', `写入 settings（${writable.length} 个模型）…`)
         try {
-          await ctx.settings.mutate(NS, [
+          await ctx.settings.mutate(ns, [
             { op: 'set', path: ['providers', provider, 'models'], value: writable },
           ])
         } catch (error) {
