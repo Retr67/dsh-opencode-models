@@ -299,9 +299,31 @@ export function apply(ctx, config = {}) {
       const described = ctx.settings.describe?.()
       const ns = settingsNamespace(described)
       const section = described?.find((row) => row.ns === ns)?.value
-      const route = section?.providers?.[provider]
-      if (!route || typeof route.baseURL !== 'string') {
-        throw new Error(`llm-pi-ai settings 里没有 ${provider} 路由（或缺少 baseURL）`)
+      // Three distinct faults used to share one sentence ("没有 X 路由（或缺少
+      // baseURL）"), so the message could not tell you which one you had — and
+      // it never told you which routes DO exist, which is the first thing you
+      // need. Keep them apart.
+      if (section === undefined) {
+        throw new Error(
+          `读不到 llm-pi-ai 的配置节（settings.describe() 里没有它的命名空间）。\n` +
+            `这通常意味着 llm-pi-ai 适配器没有加载：检查它是否在当前 profile 里启用。`,
+        )
+      }
+      const routes = Object.keys(section.providers ?? {})
+      const route = section.providers?.[provider]
+      if (route === undefined) {
+        throw new Error(
+          `llm-pi-ai 里没有 "${provider}" 这个路由。\n` +
+            `现有路由：${routes.length > 0 ? routes.join('、') : '（一个都没有）'}\n` +
+            (routes.length > 0
+              ? `修法：要么在 llm-pi-ai.providers 下新增 "${provider}"，要么把本插件的 provider 配置改成上面已有的路由名。`
+              : `修法：先在 llm-pi-ai.providers 下配置一个路由（至少要有 baseURL 与 apiKeyEnv）。`),
+        )
+      }
+      if (typeof route.baseURL !== 'string' || route.baseURL.length === 0) {
+        throw new Error(
+          `路由 "${provider}" 缺少 baseURL（应在 llm-pi-ai.providers.${provider}.baseURL 配置）。`,
+        )
       }
       const keyEnv = route.apiKeyEnv ? String(route.apiKeyEnv) : null
       let apiKey = null
