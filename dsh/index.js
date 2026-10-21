@@ -635,7 +635,11 @@ export function apply(ctx, config = {}) {
         // An explicit `false` (or any hand-set value) is the user's opt-out
         // and is preserved by the spread above.
         if (model.reasoningEfforts === undefined) {
-          model.reasoningEfforts = { minimal: null, low: 'low', medium: 'medium', high: 'high', max: 'max' }
+          // Hide a rung by OMITTING it. dsh 0.2.x accepts a null wire value only
+          // for "off"; `minimal: null` — what older versions of this plugin
+          // wrote to hide that rung — now refuses the entire write with
+          //   reasoningEfforts.minimal needs the wire value dispatch should send
+          model.reasoningEfforts = { low: 'low', medium: 'medium', high: 'high', max: 'max' }
         }
         nextModels.push(model)
         if (existing) kept.push(row.id)
@@ -643,6 +647,23 @@ export function apply(ctx, config = {}) {
       }
       for (const [id] of byId) {
         if (!listed.some((row) => row.id === id)) removed.push(id)
+      }
+
+      // Repair carried-over reasoningEfforts in place. A config synced by an
+      // older version still holds `minimal: null`, and entries are preserved
+      // field-by-field, so without this the SAME invalid value would be written
+      // back and dsh would refuse every future sync — the user would be stuck
+      // until they hand-edited YAML.
+      for (const model of nextModels) {
+        const efforts = model.reasoningEfforts
+        if (efforts === null || typeof efforts !== 'object' || Array.isArray(efforts)) continue
+        for (const level of Object.keys(efforts)) {
+          if (level === 'off') continue
+          if (efforts[level] === null || efforts[level] === '') delete efforts[level]
+        }
+        // Only "off" left is just as invalid ("offers no level beyond off"):
+        // drop the field so the installed catalog's capability applies.
+        if (!Object.keys(efforts).some((level) => level !== 'off')) delete model.reasoningEfforts
       }
 
       // 6. Write back — whenever merged content differs from what is on disk

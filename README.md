@@ -187,7 +187,8 @@ llm-pi-ai:
 - 读配置走 `settings.describe()`：dsh 0.1.x 的 `settings.get(ns)` 在 **0.2.0 已被移除**（v0.2.1 起改用 `describe().find(ns).value`，新旧版本语义等价，双向兼容）
 - 已验证的场景：模型上新自动补齐、下线模型自动移除、视觉模型自动标注、5xx 故障不误删
 - **已知限制**：服务端出现 catalog 未收录的模型、且路由未声明 `api` 时，这部分模型不会被写入（会列在结果里）。本插件不会擅自替你声明 `api`（见上文「刷新失败 / 模型未被纳入」一节）
-- 思考强度：同步的模型带 `reasoningEfforts` 声明，WebUI 出现思考强度选择器（关闭 / Minimal / Low / Medium / High / Max）。选择器停在"关闭"时完全不发送思考参数。少数模型的上游拒绝 Max（qwen3.7 系列、grok-4.5、gpt-5.6-luna、minimax-m2.7、mimo-v2.5-pro 已实测剔除，只到 High）；不想给某个模型开，把它的 `reasoningEfforts` 手动设为 `false`，同步会保留你的设置
+- 思考强度：同步的模型带 `reasoningEfforts` 声明，WebUI 出现思考强度选择器（关闭 / Low / Medium / High / Max）。选择器停在"关闭"时完全不发送思考参数。少数模型的上游拒绝 Max（qwen3.7 系列、grok-4.5、gpt-5.6-luna、minimax-m2.7、mimo-v2.5-pro 已实测剔除，只到 High）；不想给某个模型开，把它的 `reasoningEfforts` 手动设为 `false`，同步会保留你的设置
+- **`reasoningEfforts` 取值规则（dsh 0.2.x）**：想隐藏某一档就**不要声明那个 key**。除 `off` 外，任何档位的值都不能是 `null` 或空字符串，否则 dsh 会拒绝**整份**写入并报 `reasoningEfforts.<level> needs the wire value dispatch should send`。旧版本曾用 `minimal: null` 表达"隐藏 Minimal"，该写法已作废；**同步会自动清理**历史配置里的这种值，不需要你手改 YAML
 
 ## 升级到 dsh 0.2.0 后刷新报 `ctx.settings.get is not a function`
 
