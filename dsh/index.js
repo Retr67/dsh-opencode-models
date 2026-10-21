@@ -123,7 +123,6 @@ export function apply(ctx, config = {}) {
     if (detail !== undefined) state.detail = detail
   }
 
-  const chatUrl = (baseURL) => baseURL.replace(/\/+$/, '') + '/chat/completions'
   const modelsUrl = (baseURL) => baseURL.replace(/\/+$/, '') + '/models'
 
   /** List the server's model ids. Returns [{ id, raw }]. */
@@ -186,58 +185,147 @@ export function apply(ctx, config = {}) {
     return listed
   }
 
-  /** One tiny ping. Returns { status, dataPolicy, kind }. */
-  async function ping(model, apiKey, baseURL, vision, extraHeaders) {
-    const content = vision
-      ? [
+  /**
+   * The three wire protocols this gateway can expose a model on.
+   *
+   * dsh routes each model to the protocol named by the installed catalog (or,
+   * for a catalog-undescribed id, by the route's `api`) — the plugin cannot
+   * choose that and must not try to. It only needs to know whether a model
+   * answers AT ALL, which means it has to speak all three.
+   *
+   * Probing just `openai-completions` misreads every model the catalog routes
+   * elsewhere. Measured against the live gateway: chat/completions answers 400
+   * `ModelProtocolUnsupported` for grok-4.6 and grok-4.7 (catalog:
+   * openai-responses), claude-haiku-5-5 and minimax-m2.7 (anthropic-messages) —
+   * and every one of them answers 200 on its own protocol. The old single-
+   * protocol probe classified those working models as "served refused them" and
+   * deleted them from the user's config.
+   *
+   * `anthropic-messages` also authenticates differently: it wants `x-api-key`
+   * (Bearer answers 401 "Go requires a credential").
+   */
+  const PROTOCOLS = [
+    {
+      id: 'openai-completions',
+      path: '/chat/completions',
+      auth: (apiKey) => ({ Authorization: 'Bearer ' + apiKey }),
+      body: (model, content) => ({ model, max_tokens: 1, messages: [{ role: 'user', content }] }),
+      vision: (png) => [
+        { type: 'text', text: 'hi' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,' + png } },
+      ],
+    },
+    {
+      id: 'openai-responses',
+      path: '/responses',
+      auth: (apiKey) => ({ Authorization: 'Bearer ' + apiKey }),
+      body: (model, content) => ({ model, max_output_tokens: 16, input: content }),
+      vision: (png) => [{
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'hi' },
+          { type: 'input_image', image_url: 'data:image/png;base64,' + png },
+        ],
+      }],
+    },
+    {
+      id: 'anthropic-messages',
+      path: '/messages',
+      auth: (apiKey) => ({ 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }),
+      body: (model, content) => ({ model, max_tokens: 1, messages: [{ role: 'user', content }] }),
+      vision: (png) => [{
+        role: 'user',
+        content: [
           { type: 'text', text: 'hi' },
-          { type: 'image_url', image_url: { url: 'data:image/png;base64,' + PING_PNG } },
-        ]
-      : 'hi'
-    const body = JSON.stringify({
-      model,
-      max_tokens: 1,
-      messages: [{ role: 'user', content }],
-    })
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
+        ],
+      }],
+    },
+  ]
+
+  /** Whether a failure means "this endpoint isn't this model's protocol" rather than a verdict about the model. */
+  function isWrongProtocol(probe) {
+    if (probe.status === 404 || probe.status === 405) return true
+    return /ModelProtocolUnsupported|does not support this protocol/i.test(String(probe.snippet || ''))
+  }
+
+  /** One tiny request on ONE protocol. */
+  async function sendOnce(protocol, model, apiKey, baseURL, vision, extraHeaders) {
+    const payload = protocol.body(model, vision ? protocol.vision(PING_PNG) : 'hi')
+    const body = JSON.stringify(payload)
     try {
       const response = await fetchWithRetry(
-        chatUrl(baseURL),
+        baseURL.replace(/\/+$/, '') + protocol.path,
         {
           method: 'POST',
           headers: {
             ...(extraHeaders || {}),
-            Authorization: 'Bearer ' + apiKey,
+            ...protocol.auth(apiKey),
             'Content-Type': 'application/json',
-            'Content-Length': String(Buffer.byteLength(body)),
           },
           body,
         },
         3,
         timeoutMs,
       )
-      if (response.ok) return { status: response.status, kind: 'ok' }
+      if (response.ok) return { status: response.status, kind: 'ok', protocol: protocol.id }
       let snippet = ''
       try {
         snippet = (await response.text()).slice(0, 300)
       } catch {
         /* body unreadable; status is enough */
       }
-      return { status: response.status, kind: 'http', snippet }
+      return { status: response.status, kind: 'http', snippet, protocol: protocol.id }
     } catch (error) {
       return {
         status: 0,
         kind: 'network',
         message: String(error && error.message ? error.message : error),
+        protocol: protocol.id,
       }
     }
   }
 
+  /**
+   * Probe one model, trying each protocol until one answers.
+   * @param preferred - the protocol that already answered for this model.
+   * @returns the first real verdict, carrying the protocol that produced it.
+   */
+  async function ping(model, apiKey, baseURL, vision, extraHeaders, preferred) {
+    const ordered = preferred === undefined
+      ? PROTOCOLS
+      : [PROTOCOLS.find((p) => p.id === preferred), ...PROTOCOLS.filter((p) => p.id !== preferred)].filter(Boolean)
+    let last
+    for (const protocol of ordered) {
+      const probe = await sendOnce(protocol, model, apiKey, baseURL, vision, extraHeaders)
+      if (probe.kind === 'ok') return probe
+      last = probe
+      // A region block, an opt-in demand or a 5xx is a verdict about the model,
+      // not a hint to try another endpoint.
+      if (!isWrongProtocol(probe)) return probe
+    }
+    return last ?? { status: 0, kind: 'network', message: 'no protocol attempted' }
+  }
+
+  /**
+   * Turn one probe into a verdict. The wording here matches what the live
+   * gateway actually returns, which differs from the obvious guess:
+   *   - a region block is 403 `RegionError` "not available in your country"
+   *     (not a data-policy opt-in, which the old 403 => 'opt-in' rule claimed);
+   *   - a data-policy opt-in is 400 "trains on request data" (not 403);
+   *   - "ModelProtocolUnsupported" arrives as 400 and means only that THIS
+   *     endpoint isn't the model's protocol — ping() already tried the others,
+   *     so if it survives to here the model really is unavailable.
+   */
   function classify(probe) {
     if (probe.kind === 'ok') return 'available'
     if (probe.kind === 'network') return 'unknown' // never a verdict by itself
     const text = String(probe.snippet || '')
-    if (probe.status === 403 || /DataPolicy|data policy|opt in/i.test(text)) return 'opt-in'
+    if (/RegionError|not available in your country|unsupported_country_region/i.test(text)) return 'region'
+    if (/DataPolicy|trains on request data|Allow paid endpoints|opt[- ]?in/i.test(text)) return 'opt-in'
+    if (probe.status === 402) return 'unknown' // "Endpoint is unavailable": not a verdict
     if (probe.status === 401) return 'rejected'
+    if (probe.status === 403) return 'unknown' // forbidden for an unstated reason: keep
     if (probe.status === 404 || probe.status === 400) return 'rejected'
     if (probe.status >= 500) return 'flaky' // transient server fault: keep
     return 'unknown'
@@ -368,6 +456,9 @@ export function apply(ctx, config = {}) {
           available: note === 'available',
           vision: false,
           note,
+          // The protocol that answered, so the vision probe asks the same
+          // endpoint instead of re-discovering it.
+          protocol: probe.protocol,
           message: note === 'unknown' && probe.message ? probe.message : probe.snippet,
         })
       }
@@ -377,7 +468,8 @@ export function apply(ctx, config = {}) {
         doneCount = 0
         setStatus('probing', `视觉探测 0/${availableIds.length}`)
         const visions = await mapLimit(availableIds, concurrency, async (id) => {
-          const probe = await ping(id, apiKey, route.baseURL, true, routeHeaders)
+          const known = verdict.get(id)
+          const probe = await ping(id, apiKey, route.baseURL, true, routeHeaders, known?.protocol)
           doneCount++
           setStatus('probing', `视觉探测 ${doneCount}/${availableIds.length}`)
           return [id, probe]
@@ -425,13 +517,15 @@ export function apply(ctx, config = {}) {
         const v = verdict.get(row.id) || { available: false, vision: false, note: 'unknown' }
         if (!v.available) {
           const reason =
-            v.note === 'opt-in'
-              ? '需要数据政策 opt-in（403）'
-              : v.note === 'rejected'
-                ? '服务端明确拒绝（400/401）'
-                : v.note === 'flaky'
-                  ? '5xx 暂时故障（保留）'
-                  : '无法判定（保留）' + (v.message ? '：' + String(v.message).slice(0, 120) : '')
+            v.note === 'region'
+              ? '地区不可用（403 RegionError）'
+              : v.note === 'opt-in'
+                ? '需要数据政策 opt-in（上游要求同意用请求数据训练）'
+                : v.note === 'rejected'
+                  ? '服务端明确拒绝（三个协议都尝试过）'
+                  : v.note === 'flaky'
+                    ? '5xx 暂时故障（保留）'
+                    : '无法判定（保留）' + (v.message ? '：' + String(v.message).slice(0, 120) : '')
           const entry = byId.get(row.id)
           if (entry && (v.note === 'flaky' || v.note === 'unknown' || rescued.has(row.id))) {
             // Keep previously configured entries on flaky/unknown — do not
@@ -480,7 +574,7 @@ export function apply(ctx, config = {}) {
         // An explicit `false` (or any hand-set value) is the user's opt-out
         // and is preserved by the spread above.
         if (model.reasoningEfforts === undefined) {
-          model.reasoningEfforts = { minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'max' }
+          model.reasoningEfforts = { minimal: null, low: 'low', medium: 'medium', high: 'high', max: 'max' }
         }
         nextModels.push(model)
         if (existing) kept.push(row.id)

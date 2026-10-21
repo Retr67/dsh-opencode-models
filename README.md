@@ -42,17 +42,41 @@ npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/Retr67/dsh-o
    - **新增**：服务端有、配置里没有的模型；
    - **保留**：继续可用的模型；
    - **移除**：配置里有、服务端已下线的模型；
-   - **服务端拒绝**：在 `/models` 里但实测被拒的模型（400/401 明确拒绝、403 数据政策 opt-in）；
+   - **服务端拒绝**：在 `/models` 里但实测不可用的模型（地区封锁 / 需 opt-in / 明确拒绝）；
    - **未纳入（catalog 未收录）**：可用但 dsh 内置 catalog 不认识、且路由未声明 `api` 的模型（见下文如何纳入）。
 
 ## 探测与安全策略
 
-对每个模型发两类微型真实请求（`max_tokens: 1`，并发 6）：
+对每个模型发微型真实请求（`max_tokens: 1`，并发 6）。
 
-| 探测 | 判定 |
+### 三种协议都会尝试
+
+网关上的模型分属三种 wire 协议。**dsh 按 catalog 给每个模型定的协议自动路由**，插件不干预也不该干预 —— 但插件必须"问得通"，才能判断模型是否真的可用：
+
+| 协议 | 端点 | 鉴权 |
+|---|---|---|
+| `openai-completions` | `POST {baseURL}/chat/completions` | `Authorization: Bearer` |
+| `openai-responses` | `POST {baseURL}/responses` | `Authorization: Bearer` |
+| `anthropic-messages` | `POST {baseURL}/messages` | `x-api-key` + `anthropic-version`（Bearer 会被拒） |
+
+插件先试 `openai-completions`；只有当失败信息表明「协议不对」（`ModelProtocolUnsupported` / 404 / 405）时，才换下一个协议重试。地区封锁、opt-in、5xx 等是关于**模型的结论**，不会白跑另外两个协议。
+
+> **为什么必须这样做**：2026-10-22 在真实网关上实测，`grok-4.6` / `grok-4.7` 在 `/chat/completions` 返回 400 `ModelProtocolUnsupported`，但在 `/responses` 返回 **200**；`claude-haiku-5-5` / `minimax-m2.7` 在 completions 返回 400，在 `/messages`（配 `x-api-key`）返回 **200**。只探一种协议的旧版本会把这几只**完全可用**的模型判成「服务端拒绝」并从你自己的配置里删掉。
+
+### 判定
+
+| 探测结果 | 判定 |
 |---|---|
-| 文本 ping | 200 → 可用；400/401 → 明确拒绝（不进列表）；403 → 需数据政策 opt-in；5xx → 暂时故障（**保留**）；网络错误 → 无法判定（**保留**） |
-| 图像 ping（1×1 PNG） | 200 → 标注 `input: [text, image]`；否则纯文本 |
+| 任一协议 200 | **可用** |
+| 403 `RegionError`「not available in your country」 | **地区不可用**（移除） |
+| 400 含数据政策字样（如「trains on request data」） | **需 opt-in**（移除） |
+| 三协议均 `ModelProtocolUnsupported` / 400 / 401 | **服务端明确拒绝**（移除） |
+| 402「Endpoint is unavailable」 | **无法判定**（**保留**） |
+| 5xx | 暂时故障（**保留**） |
+| 网络错误 | 无法判定（**保留**） |
+| 图像 ping（1×1 PNG，走该模型已答通的协议） | 200 → 标注 `input: [text, image]` |
+
+> 旧版本把 403 一律当成「需要数据政策 opt-in」，但真实网关的 403 主要是**地区封锁**，而真正的 opt-in 反而返回 400。现在按响应体区分。
 
 写回保护：
 
@@ -108,7 +132,7 @@ dsh 给一个模型定 wire 协议时按这个顺序解析：
 | 路由**未声明** `api`，但有 catalog 认识的模型 | **认识的照常写入**；不认识的列在「未纳入（catalog 未收录）」里，不写入 |
 | 路由**未声明** `api`，且一个认识的都没有 | 拒绝写入并报错（写空列表会把你已配置的模型丢回 catalog 默认值） |
 
-也就是说：**同步能推进多少就推进多少**，不会再因为一个新模型导致整份列表都写不进去。未纳入的模型会明确列出来，而不是悄悄丢掉。
+也就是说：**同步能推进多少就推进多少**，不会再因为一个新模型导致整份列表写不进去。未纳入的模型会明确列出来，而不是悄悄丢掉。
 
 ### 想让那部分模型也纳入
 
@@ -124,30 +148,6 @@ llm-pi-ai:
 ```
 
 加了之后刷新，未收录的模型也会被写入。
-
-如果你看到过这样的报错：
-
-```
-刷新失败：llm-pi-ai: provider "opencode-go" model "minimax-m2.5" needs an api;
-the installed catalog does not describe it, so set the route's api to the wire protocol its endpoint speaks
-```
-
-**这不是探测失败，而是写回被 dsh 拒绝了。** 原因是：
-
-1. 服务端上线了 dsh 内置 catalog（pi-ai 静态快照）**还没收录**的模型；
-2. 你的路由**没有声明 `api`**；
-3. dsh 解析一个模型的协议时走 `路由 api → catalog 里该模型的协议 → 该路由 catalog 的唯一协议`。`opencode-go` 的 catalog 同时含 `anthropic-messages` / `openai-completions` / `openai-responses` 三种协议，**没有唯一协议可用**，于是 catalog 不认识的模型无从定协议，dsh 拒绝写入整份列表（宁可不写，也不写一份无法服务的配置）。
-
-修法：在路由下加一行 `api`。本插件的探测走 `POST {baseURL}/chat/completions`，所以通常是 `openai-completions`：
-
-```yaml
-llm-pi-ai:
-  providers:
-    opencode-go:
-      api: openai-completions     # ← 加这一行
-      baseURL: https://opencode.ai/zen/go/v1
-      apiKeyEnv: OPENCODE_GO_API_KEY
-```
 
 > **注意（重要）**：catalog 路由一旦**显式**声明 `api`，dsh 会改用协议实现（`createProvider`）而不是复用 catalog provider 来构造该路由。catalog provider 会按会话自动注入 `x-opencode-session`，改走协议实现后**这个自动注入就没了**。所以如果你的网关要求该头（OpenCode Go 就是），请把 header 一并显式写上：
 >
