@@ -442,11 +442,15 @@ export function apply(ctx, config = {}) {
               `或把本插件的 provider 配置改成上面已有的路由名。`,
           )
         }
+        // Write ONLY the two config fields. `probedHeaders` is a plugin-internal
+        // default for its own requests; writing it would pin a fixed session id
+        // into the user's config, replacing the per-conversation id chat uses.
+        const written = { baseURL: template.baseURL, apiKeyEnv: template.apiKeyEnv }
         setStatus('listing', `自动创建路由 ${provider}…`)
         await ctx.settings.mutate(ns, [
-          { op: 'set', path: ['providers', provider], value: { ...template } },
+          { op: 'set', path: ['providers', provider], value: written },
         ])
-        route = { ...template }
+        route = { ...written }
         createdRoute = true
       }
       // A route may omit baseURL: a catalog-backed provider takes its baseUrl
@@ -633,14 +637,9 @@ export function apply(ctx, config = {}) {
         // of upstreams reject effort=max (qwen3.7 series, grok-4.5, ...) —
         // drop the `max` key by hand for those; sync preserves manual edits.
         // An explicit `false` (or any hand-set value) is the user's opt-out
-        // and is preserved by the spread above.
-        if (model.reasoningEfforts === undefined) {
-          // Hide a rung by OMITTING it. dsh 0.2.x accepts a null wire value only
-          // for "off"; `minimal: null` — what older versions of this plugin
-          // wrote to hide that rung — now refuses the entire write with
-          //   reasoningEfforts.minimal needs the wire value dispatch should send
-          model.reasoningEfforts = { low: 'low', medium: 'medium', high: 'high', max: 'max' }
-        }
+        // and is preserved by the spread above. The ladder itself is filled in
+        // after the repair pass below, so a cleaned-up entry converges in ONE
+        // run instead of gaining its ladder on the next sync.
         nextModels.push(model)
         if (existing) kept.push(row.id)
         else added.push(row.id)
@@ -664,6 +663,18 @@ export function apply(ctx, config = {}) {
         // Only "off" left is just as invalid ("offers no level beyond off"):
         // drop the field so the installed catalog's capability applies.
         if (!Object.keys(efforts).some((level) => level !== 'off')) delete model.reasoningEfforts
+      }
+
+      // Now declare the ladder for anything still unset — new models AND entries
+      // whose illegal value the repair just removed. Doing it here (rather than
+      // inside the merge loop) keeps one sync sufficient: a repair that erased an
+      // empty/illegal map would otherwise read as "never declared" on the next
+      // run and gain its ladder then, so config churned twice for one outcome.
+      // Hide a rung by OMITTING it; only "off" may hold a null wire value.
+      for (const model of nextModels) {
+        if (model.reasoningEfforts === undefined) {
+          model.reasoningEfforts = { low: 'low', medium: 'medium', high: 'high', max: 'max' }
+        }
       }
 
       // 6. Write back — whenever merged content differs from what is on disk
@@ -721,9 +732,14 @@ export function apply(ctx, config = {}) {
       if (changed) {
         setStatus('writing', `写入 settings（${writable.length} 个模型）…`)
         try {
-          await ctx.settings.mutate(ns, [
-            { op: 'set', path: ['providers', provider, 'models'], value: writable },
-          ])
+          // A route that declares `api` but omits baseURL is refused by dsh for any
+          // undescribed model ("needs a baseURL"). The plugin knows the endpoint,
+          // so it completes the route in the same write rather than failing.
+          const ops = [{ op: 'set', path: ['providers', provider, 'models'], value: writable }]
+          if ((typeof route.baseURL !== 'string' || route.baseURL.length === 0) && defaults.baseURL) {
+            ops.push({ op: 'set', path: ['providers', provider, 'baseURL'], value: defaults.baseURL })
+          }
+          await ctx.settings.mutate(ns, ops)
         } catch (error) {
           const message = String(error && error.message ? error.message : error)
           // A route that names no `api` can only serve models the installed

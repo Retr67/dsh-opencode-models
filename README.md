@@ -33,9 +33,10 @@ npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/Retr67/dsh-o
 
 | 情况 | 行为 |
 |---|---|
-| 没有目标路由，且是它认识的 provider | **自动创建**，然后正常同步 |
+| 没有目标路由，且是它认识的 provider | **自动创建**（只写 `baseURL` + `apiKeyEnv`），然后正常同步 |
 | 没有目标路由，且不认识这个 provider | 报错并**列出当前实际存在的路由名** |
 | 路由存在但没有 `baseURL`，是它认识的 provider | 用内置默认端点，正常同步 |
+| 同上，但路由**声明了 `api`** | 顺带把 `baseURL` 补写进路由 —— 否则 dsh 会拒绝未收录模型（`needs a baseURL`） |
 | 路由存在但没有 `baseURL`，是不认识的 provider | 指出缺哪个字段 |
 | 读不到 `llm-pi-ai` 配置节 | 提示适配器可能没加载 |
 
