@@ -102,7 +102,8 @@ window.__ModuleLoader__.load({
       return [
         h('div', { className: 'dsh-om-head', key: 'head' },
           '服务端共 ' + result.serverCount + ' 个模型，本次配置 ' + result.configuredCount + ' 个。' +
-            (result.written ? '已写入 settings.yaml。' : '列表无变化，未写入。')),
+            (result.written ? '已写入 settings.yaml。' : '列表无变化，未写入。') +
+            (result.createdRoute ? '（路由原本不存在，已自动创建。）' : '')),
         h(ResultGroup, { title: '新增', rows: result.added, tone: 'add', tag: 'ADD', key: 'g-add' }),
         h(ResultGroup, { title: '保留', rows: result.kept, tone: 'keep', tag: 'KEEP', key: 'g-keep' }),
         h(ResultGroup, { title: '移除', rows: result.removed, tone: 'remove', tag: 'REMOVE', key: 'g-remove' }),

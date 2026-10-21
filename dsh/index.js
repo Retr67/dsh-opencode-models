@@ -54,6 +54,33 @@ const PROBE_API = 'openai-completions'
 const PING_PNG =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 
+/**
+ * Shipped defaults for the providers this plugin knows, used for exactly two
+ * jobs: creating a missing route, and resolving a baseURL the route omits.
+ *
+ * `api` and `headers` are deliberately absent. A catalog-backed route must NOT
+ * name `api`: that switches provider construction from the catalog provider —
+ * which injects the gateway's per-conversation `x-opencode-session` header — to
+ * the raw protocol implementation, and every chat request then fails. The
+ * gateway's own config proves the minimal shape: this profile's entire
+ * llm-pi-ai config is one `apiKeyEnv` line and chat works, because baseURL,
+ * protocol and the session header all come from the installed catalog.
+ */
+const PROVIDER_DEFAULTS = {
+  'opencode-go': {
+    baseURL: 'https://opencode.ai/zen/go/v1',
+    apiKeyEnv: 'OPENCODE_GO_API_KEY',
+    // This gateway wants a session id on EVERY wire request: /models and all
+    // three protocol endpoints answer 400 MissingSessionID without one
+    // (measured 2026-10-22). dsh's catalog provider injects the per-conversation
+    // id for chat, but the plugin issues its own requests, so it supplies a
+    // stable one when the route does not. Used for probes only — never written
+    // into the config, where a fixed value would replace the per-conversation
+    // id that chat relies on.
+    probedHeaders: { 'x-opencode-session': 'dsh-opencode-models' },
+  },
+}
+
 const FRIENDLY = {
   gpt: 'GPT',
   glm: 'GLM',
@@ -398,29 +425,56 @@ export function apply(ctx, config = {}) {
         )
       }
       const routes = Object.keys(section.providers ?? {})
-      const route = section.providers?.[provider]
+      let route = section.providers?.[provider]
+      let createdRoute = false
       if (route === undefined) {
+        // The route does not exist. dsh can serve a catalog-backed provider from
+        // just a credential reference, so a new user has nothing to copy from —
+        // and being told "go write baseURL + apiKeyEnv yourself" is exactly the
+        // friction this plugin exists to remove. Create it from the shipped
+        // defaults, and only for a provider we actually know.
+        const template = PROVIDER_DEFAULTS[provider]
+        if (template === undefined) {
+          throw new Error(
+            `llm-pi-ai 里没有 "${provider}" 这个路由，插件也不认识这个 provider，无法自动创建。\n` +
+              `现有路由：${routes.length > 0 ? routes.join('、') : '（一个都没有）'}\n` +
+              `修法：在 llm-pi-ai.providers 下新增 "${provider}"（至少要有 baseURL 与 apiKeyEnv），` +
+              `或把本插件的 provider 配置改成上面已有的路由名。`,
+          )
+        }
+        setStatus('listing', `自动创建路由 ${provider}…`)
+        await ctx.settings.mutate(ns, [
+          { op: 'set', path: ['providers', provider], value: { ...template } },
+        ])
+        route = { ...template }
+        createdRoute = true
+      }
+      // A route may omit baseURL: a catalog-backed provider takes its baseUrl
+      // from the installed catalog, so dsh chats fine without it — measured on
+      // this profile, whose whole llm-pi-ai config is one `apiKeyEnv` line while
+      // chat works. The plugin builds its own URLs, so it resolves the same
+      // value locally instead of demanding config that dsh does not.
+      const defaults = PROVIDER_DEFAULTS[provider] ?? {}
+      const baseURL = (typeof route.baseURL === 'string' && route.baseURL.length > 0)
+        ? route.baseURL
+        : defaults.baseURL
+      if (typeof baseURL !== 'string' || baseURL.length === 0) {
         throw new Error(
-          `llm-pi-ai 里没有 "${provider}" 这个路由。\n` +
-            `现有路由：${routes.length > 0 ? routes.join('、') : '（一个都没有）'}\n` +
-            (routes.length > 0
-              ? `修法：要么在 llm-pi-ai.providers 下新增 "${provider}"，要么把本插件的 provider 配置改成上面已有的路由名。`
-              : `修法：先在 llm-pi-ai.providers 下配置一个路由（至少要有 baseURL 与 apiKeyEnv）。`),
+          `路由 "${provider}" 缺少 baseURL，插件也不知道这个 provider 的默认端点。\n` +
+            `修法：在 llm-pi-ai.providers.${provider}.baseURL 配置它。`,
         )
       }
-      if (typeof route.baseURL !== 'string' || route.baseURL.length === 0) {
-        throw new Error(
-          `路由 "${provider}" 缺少 baseURL（应在 llm-pi-ai.providers.${provider}.baseURL 配置）。`,
-        )
-      }
-      const keyEnv = route.apiKeyEnv ? String(route.apiKeyEnv) : null
+      const keyEnv = route.apiKeyEnv ? String(route.apiKeyEnv) : (defaults.apiKeyEnv ?? null)
       let apiKey = null
       if (keyEnv) {
         const resolved = await ctx.credentials.resolve(keyEnv)
         apiKey = resolved?.value || null
       }
       if (!apiKey) {
-        throw new Error(`凭据 ${keyEnv || '(未配置 apiKeyEnv)'} 不可用`)
+        throw new Error(
+          `凭据 ${keyEnv || '(未配置 apiKeyEnv)'} 不可用。\n` +
+            `修法：在 dsh 的设置里为该凭据填入 API key，或在路由里把 apiKeyEnv 指向已有的凭据名。`,
+        )
       }
       const currentModels = Array.isArray(route.models) ? route.models : []
       const byId = new Map()
@@ -429,13 +483,20 @@ export function apply(ctx, config = {}) {
       }
       // Provider-level headers (e.g. an aggregator-gateway session id) apply
       // to every wire request the plugin makes, exactly as the llm adapter
-      // applies them to chat calls.
-      const routeHeaders =
-        route.headers && typeof route.headers === 'object' ? route.headers : {}
+      // applies them to chat calls. Gaps are filled from the shipped defaults,
+      // so a minimal route (the `apiKeyEnv`-only shape dsh itself accepts) is
+      // still probeable.
+      const routeHeaders = {
+        ...(route.headers && typeof route.headers === 'object' ? route.headers : {}),
+      }
+      for (const [name, value] of Object.entries(PROVIDER_DEFAULTS[provider]?.probedHeaders ?? {})) {
+        const present = Object.keys(routeHeaders).some((key) => key.toLowerCase() === name.toLowerCase())
+        if (!present) routeHeaders[name] = value
+      }
 
       // 2. Server listing.
-      setStatus('listing', '拉取 ' + route.baseURL + '/models…')
-      const listed = await listModels(route.baseURL, apiKey, routeHeaders)
+      setStatus('listing', '拉取 ' + baseURL + '/models…')
+      const listed = await listModels(baseURL, apiKey, routeHeaders)
       if (listed.length === 0) {
         throw new Error('服务端 /models 返回空列表')
       }
@@ -445,7 +506,7 @@ export function apply(ctx, config = {}) {
       setStatus('probing', `可用性探测 0/${listed.length}`)
       let doneCount = 0
       const availability = await mapLimit(listed, concurrency, async (row) => {
-        const probe = await ping(row.id, apiKey, route.baseURL, false, routeHeaders)
+        const probe = await ping(row.id, apiKey, baseURL, false, routeHeaders)
         doneCount++
         setStatus('probing', `可用性探测 ${doneCount}/${listed.length}`)
         return [row.id, probe]
@@ -469,7 +530,7 @@ export function apply(ctx, config = {}) {
         setStatus('probing', `视觉探测 0/${availableIds.length}`)
         const visions = await mapLimit(availableIds, concurrency, async (id) => {
           const known = verdict.get(id)
-          const probe = await ping(id, apiKey, route.baseURL, true, routeHeaders, known?.protocol)
+          const probe = await ping(id, apiKey, baseURL, true, routeHeaders, known?.protocol)
           doneCount++
           setStatus('probing', `视觉探测 ${doneCount}/${availableIds.length}`)
           return [id, probe]
@@ -682,6 +743,7 @@ export function apply(ctx, config = {}) {
       state.result = {
         serverCount: listed.length,
         configuredCount: nextModels.length,
+        createdRoute,
         added,
         kept,
         removed,
