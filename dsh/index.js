@@ -775,14 +775,20 @@ export function apply(ctx, config = {}) {
       }
 
       state.phase = 'done'
-      state.detail = `完成：共 ${listed.length}，可用 ${nextModels.length}`
+      // Report what actually reached the file, not what was merely available.
+      // `added`/`kept` are built while merging, BEFORE the catalog-undescribed
+      // filter narrows `writable`, so an undescribed model was listed as BOTH
+      // 新增 and 未纳入 — the same 8 models in two groups, under a
+      // "本次配置 28 个" that was really 20. Counts must match the write.
+      const writtenIds = new Set(writable.map((model) => model.id))
+      state.detail = `完成：共 ${listed.length}，写入 ${writable.length} 个`
       state.finishedAt = Date.now()
       state.result = {
         serverCount: listed.length,
-        configuredCount: nextModels.length,
+        configuredCount: writable.length,
         createdRoute,
-        added,
-        kept,
+        added: added.filter((id) => writtenIds.has(id)),
+        kept: kept.filter((id) => writtenIds.has(id)),
         removed,
         unavailable,
         // Models the server offers but this route cannot serve, because the
