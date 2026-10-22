@@ -754,6 +754,51 @@ export function apply(ctx, config = {}) {
           extraGroups.get(name).models.push(model)
         }
       }
+      // Real capacity for companion-route models. They are not in this route's
+      // catalog, so without this they inherit dsh's blanket defaults
+      // (262144 / 32768). OpenCode publishes the same model ids in its sibling
+      // Zen catalog, and runtime discovery can read that without touching files:
+      // two values were verified against this endpoint exactly (kimi-k2.6
+      // 262144, minimax-m2.5 204800).
+      //
+      // Only values at or BELOW the default are written. Over-reporting context
+      // makes dsh build prompts the endpoint rejects — a hard failure — while
+      // under-reporting merely forgoes capacity. Measured case in point:
+      // glm-5.1 is 204800 in the Zen catalog yet this endpoint accepts
+      // max_tokens=1048576, so the catalog value is a conservative floor, not a
+      // ceiling. A model the sibling catalog lacks keeps the defaults.
+      if (extraGroups.size > 0) {
+        const caps = new Map()
+        try {
+          const llm = ctx.get?.('llm')
+          if (llm && typeof llm.discoverModels === 'function') {
+            for (const sibling of ['opencode']) {
+              for (const row of (await llm.discoverModels(ns, { provider: sibling })) ?? []) {
+                if (row && typeof row.id === 'string') caps.set(row.id, row)
+              }
+            }
+          }
+        } catch { /* no sibling catalog: keep the defaults */ }
+        const DEFAULT_CONTEXT = 262144
+        for (const group of extraGroups.values()) {
+          for (const model of group.models) {
+            const cap = caps.get(model.id)
+            if (cap === undefined) continue
+            if (model.contextWindow === undefined
+              && typeof cap.contextWindow === 'number' && cap.contextWindow <= DEFAULT_CONTEXT) {
+              model.contextWindow = cap.contextWindow
+            }
+            // Output cap: the model's own documented figure, never larger than
+            // the context we just settled on (output can never exceed it).
+            const context = model.contextWindow ?? DEFAULT_CONTEXT
+            if (model.maxTokens === undefined
+              && typeof cap.maxTokens === 'number' && cap.maxTokens > 0 && cap.maxTokens <= context) {
+              model.maxTokens = cap.maxTokens
+            }
+          }
+        }
+      }
+
       // A companion route that is no longer needed is emptied rather than
       // deleted: removing a provider entry is a bigger, harder-to-undo action
       // than leaving it serving nothing.
