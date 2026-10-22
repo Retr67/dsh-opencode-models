@@ -917,6 +917,17 @@ export function apply(ctx, config = {}) {
       // "本次配置 28 个" that was really 20. Counts must match the write.
       const extraIds = new Set(extraReport.flatMap((group) => group.models))
       const writtenIds = new Set([...writable.map((model) => model.id), ...extraIds])
+      // A companion model is "already there" when its route already lists it.
+      // `byId` — which decides 新增 vs 保留 — is built from the MAIN route only,
+      // so a companion model looked new on every sync: the write was a genuine
+      // no-op, yet the page announced the same 8 as 新增 each time.
+      const existingCompanionIds = new Set()
+      for (const suffix of Object.values(PROTO_SUFFIX)) {
+        const companion = section.providers?.[`${provider}-${suffix}`]
+        for (const model of (Array.isArray(companion?.models) ? companion.models : [])) {
+          if (model && typeof model.id === 'string') existingCompanionIds.add(model.id)
+        }
+      }
       state.detail = `完成：共 ${listed.length}，写入 ${writable.length}${extraIds.size > 0 ? ` + 扩展路由 ${extraIds.size}` : ''} 个`
       state.finishedAt = Date.now()
       state.result = {
@@ -925,8 +936,11 @@ export function apply(ctx, config = {}) {
         extraCount: extraIds.size,
         extraRoutes: extraReport,
         createdRoute,
-        added: added.filter((id) => writtenIds.has(id)),
-        kept: kept.filter((id) => writtenIds.has(id)),
+        added: added.filter((id) => writtenIds.has(id) && !existingCompanionIds.has(id)),
+        kept: [
+          ...kept.filter((id) => writtenIds.has(id)),
+          ...added.filter((id) => writtenIds.has(id) && existingCompanionIds.has(id)),
+        ],
         removed,
         unavailable,
         // Catalog-undescribed models that STILL could not be placed: only a

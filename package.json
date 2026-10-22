@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencode-models",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "DeepSeek Harness (DSH) 插件：在设置页新增「OpenCode Go 模型同步」，一键拉取服务端全部模型、实测可用性与视觉能力并写回 llm-pi-ai 配置（补齐 dsh 内置「获取可用模型」静态快照的缺口）。",
   "type": "module",
   "license": "MIT",
