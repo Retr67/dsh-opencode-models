@@ -99,16 +99,30 @@ window.__ModuleLoader__.load({
         return h('div', { className: 'dsh-om-err' }, '刷新失败：' + error)
       }
       if (!result) return null
+      // Catalog-undescribed models now land in their own per-protocol route
+      // instead of being refused, so they get a positive group rather than the
+      // old "NEEDS API" bucket.
+      var extraGroups = (result.extraRoutes || []).map(function (route) {
+        return h(ResultGroup, {
+          title: '扩展路由 · ' + route.provider + '（' + route.protocol + '）',
+          rows: route.models,
+          tone: 'add',
+          tag: 'ROUTE',
+          key: 'g-extra-' + route.provider,
+        })
+      })
       return [
         h('div', { className: 'dsh-om-head', key: 'head' },
-          '服务端共 ' + result.serverCount + ' 个模型，本次配置 ' + result.configuredCount + ' 个。' +
+          '服务端共 ' + result.serverCount + ' 个模型，本次配置 ' + result.configuredCount + ' 个' +
+            (result.extraCount > 0 ? '（另有 ' + result.extraCount + ' 个在扩展路由）' : '') + '。' +
             (result.written ? '已写入 settings.yaml。' : '列表无变化，未写入。') +
             (result.createdRoute ? '（路由原本不存在，已自动创建。）' : '')),
         h(ResultGroup, { title: '新增', rows: result.added, tone: 'add', tag: 'ADD', key: 'g-add' }),
         h(ResultGroup, { title: '保留', rows: result.kept, tone: 'keep', tag: 'KEEP', key: 'g-keep' }),
         h(ResultGroup, { title: '移除', rows: result.removed, tone: 'remove', tag: 'REMOVE', key: 'g-remove' }),
         h(ResultGroup, { title: '服务端拒绝', rows: result.unavailable, tone: 'skip', tag: 'SKIP', key: 'g-skip' }),
-        h(ResultGroup, { title: '未纳入（catalog 未收录）', rows: result.skipped, tone: 'skip', tag: 'NEEDS API', key: 'g-skipped' }),
+        extraGroups,
+        h(ResultGroup, { title: '未纳入', rows: result.skipped, tone: 'skip', tag: 'SKIP', key: 'g-skipped' }),
       ]
     }
 

@@ -116,7 +116,41 @@ npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/Retr67/dsh-o
 
 > 探测请求与列表请求会携带该 provider 路由配置里的 `headers`（llm-pi-ai 路由可配 `headers: { ... }`）。部分聚合网关（如 OpenCode Go）要求 `x-opencode-session` 请求头——确保它在你的路由 headers 里，否则探测会被网关判为拒绝。
 
-## 刷新失败 / 模型未被纳入：`model "xxx" needs an api`
+## 扩展路由：catalog 未收录的模型怎么进得来
+
+服务端上新快于 dsh 内置的 catalog，所以总会有「dsh 不认识」的模型。dsh 的规则是：路由没声明 `api` 时，它无法为不认识的模型确定协议，于是**拒绝整份写入**。
+
+**插件现在的做法（v0.5.0 起）**：把这些模型分流到按协议命名的**扩展路由**里，主路由原样不动。
+
+```yaml
+llm-pi-ai:
+  providers:
+    opencode-go:                    # 主路由：不声明 api
+      apiKeyEnv: OPENCODE_GO_API_KEY
+      models: [ ...catalog 收录的模型... ]   # 各自的真实协议 + 完整规格
+
+    opencode-go-completions:        # 扩展路由：只装未收录、且实测走 completions 的
+      api: openai-completions
+      baseURL: https://opencode.ai/zen/go/v1
+      apiKeyEnv: OPENCODE_GO_API_KEY
+      headers: { x-opencode-session: dsh-opencode-models }
+      models: [ ... ]
+```
+
+为什么要拆开，而不是"在主路由上直接加 `api`"：
+
+| 做法 | 结果 |
+|---|---|
+| 主路由加 `api: openai-completions` | 8 个能写进来，**但**整条路由的模型都被强制用 completions —— 实测 `grok-4.6` / `grok-4.7`（只会 responses）和 `claude-haiku-5-5`（只会 anthropic）立刻变 400 |
+| 拆成扩展路由（现在的做法） | 28 个全部可用，**0 个被弄坏** |
+
+扩展路由的模型为什么也会显示「思考强度」：这类路由不是 catalog provider，拿不到 catalog 元数据，所以插件**逐条写入 `reasoningEfforts`**（以及实测到的视觉标记），把它们补回来。上下文/输出上限则用 dsh 的默认值（262144 / 32768），因为这些模型本来就没有官方规格可抄。
+
+扩展路由是**按需创建**的：今天所有未收录模型都在 completions 上可用，所以只会出现一条 `-completions`；将来若有模型只在 responses 上可用，才会多出 `-responses` 一条。
+
+> 副作用：模型选择器里会多出「OpenCode Go-completions」这样的 provider 分组。这是把"不认识"和"认识"分开的代价。
+
+## 刷新失败：`model "xxx" needs an api`
 
 服务端会先于 catalog 上新，所以同步时**可能有一部分模型写不进去**。这是设计使然，不是故障。
 
@@ -187,7 +221,7 @@ llm-pi-ai:
 - 零构建、零运行时依赖（宿主与浏览器端均为 node/DOM 内置能力）
 - 读配置走 `settings.describe()`：dsh 0.1.x 的 `settings.get(ns)` 在 **0.2.0 已被移除**（v0.2.1 起改用 `describe().find(ns).value`，新旧版本语义等价，双向兼容）
 - 已验证的场景：模型上新自动补齐、下线模型自动移除、视觉模型自动标注、5xx 故障不误删
-- **已知限制**：服务端出现 catalog 未收录的模型、且路由未声明 `api` 时，这部分模型不会被写入（会列在结果里）。本插件不会擅自替你声明 `api`（见上文「刷新失败 / 模型未被纳入」一节）
+- **catalog 未收录的模型：自动分流到「扩展路由」**（v0.5.0 起）。主路由保持不声明 `api`，所以 catalog 收录的模型仍走它们各自的真实协议、并保住上下文/视觉/思考能力；未收录的模型则按**实测能用的协议**写入独立的 `<provider>-completions` / `-responses` / `-anthropic` 路由（该路由自带 `api`、端点与网关会话头）。详见下文「扩展路由」一节
 - 思考强度：同步的模型带 `reasoningEfforts` 声明，WebUI 出现思考强度选择器（关闭 / Low / Medium / High / Max）。选择器停在"关闭"时完全不发送思考参数。少数模型的上游拒绝 Max（qwen3.7 系列、grok-4.5、gpt-5.6-luna、minimax-m2.7、mimo-v2.5-pro 已实测剔除，只到 High）；不想给某个模型开，把它的 `reasoningEfforts` 手动设为 `false`，同步会保留你的设置
 - **`reasoningEfforts` 取值规则（dsh 0.2.x）**：想隐藏某一档就**不要声明那个 key**。除 `off` 外，任何档位的值都不能是 `null` 或空字符串，否则 dsh 会拒绝**整份**写入并报 `reasoningEfforts.<level> needs the wire value dispatch should send`。旧版本曾用 `minimal: null` 表达"隐藏 Minimal"，该写法已作废；**同步会自动清理**历史配置里的这种值，不需要你手改 YAML
 

@@ -55,6 +55,28 @@ const PING_PNG =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 
 /**
+ * Route-name suffix per wire protocol, for the companion routes that carry
+ * catalog-undescribed models.
+ *
+ * Why companion routes at all: a route that names no `api` can only serve
+ * models the installed catalog describes (issue #1), and a route that DOES name
+ * one forces that protocol onto EVERY model on it — measured, after declaring
+ * api the catalog metadata survives but grok-4.6/grok-4.7 (responses-only) and
+ * claude-haiku-5-5 (anthropic-only) start answering 400 on completions. So one
+ * route cannot hold both kinds.
+ *
+ * The split is chosen to keep metadata loss at zero: the main route (a real
+ * catalog provider name) keeps the catalog-described models with their full
+ * specs, and only catalog-undescribed models — which have no catalog metadata
+ * to lose — move to these companion routes.
+ */
+const PROTO_SUFFIX = {
+  'openai-completions': 'completions',
+  'openai-responses': 'responses',
+  'anthropic-messages': 'anthropic',
+}
+
+/**
  * Shipped defaults for the providers this plugin knows, used for exactly two
  * jobs: creating a missing route, and resolving a baseURL the route omits.
  *
@@ -706,6 +728,44 @@ export function apply(ctx, config = {}) {
         ? nextModels.filter((model) => catalogIds.has(model.id))
         : nextModels
 
+      // Companion routes: one per protocol, carrying only catalog-undescribed
+      // models. They declare an `api` (so dsh can resolve a protocol for an id it
+      // does not know) and therefore cannot be the catalog route — which is why
+      // the described models stay behind on `provider`, where the catalog still
+      // supplies their real specs, vision support and reasoning capability.
+      // `verdict.protocol` is the endpoint that actually answered during probing,
+      // so a model lands on the route that can serve it.
+      const extraGroups = new Map() // routeName → { protocol, models, headers }
+      if (undescribed.length > 0) {
+        // The companion route has no catalog provider behind it, so nothing
+        // injects this gateway's session header for chat — it has to be written
+        // into the route. `routeHeaders` is the merged set (the user's own
+        // headers plus the shipped probe default), which is exactly what chat
+        // needs; the earlier `route.headers` here produced an empty object
+        // whenever the main route omitted headers, and those 8 models would then
+        // answer 400 on every chat.
+        const baseHeaders = { ...routeHeaders }
+        for (const model of undescribed) {
+          const protocol = verdict.get(model.id)?.protocol
+          const suffix = PROTO_SUFFIX[protocol]
+          if (suffix === undefined) continue // unknown protocol: leave it skipped
+          const name = `${provider}-${suffix}`
+          if (!extraGroups.has(name)) extraGroups.set(name, { protocol, models: [], headers: baseHeaders })
+          extraGroups.get(name).models.push(model)
+        }
+      }
+      // A companion route that is no longer needed is emptied rather than
+      // deleted: removing a provider entry is a bigger, harder-to-undo action
+      // than leaving it serving nothing.
+      for (const suffix of Object.values(PROTO_SUFFIX)) {
+        const name = `${provider}-${suffix}`
+        if (extraGroups.has(name)) continue
+        if (section.providers?.[name] === undefined) continue
+        const stale = section.providers[name]
+        if (Array.isArray(stale.models) && stale.models.length === 0) continue
+        extraGroups.set(name, { protocol: stale.api, models: [], headers: {}, retire: true })
+      }
+
       const changed = JSON.stringify(currentModels) !== JSON.stringify(writable)
       if (changed && writable.length === 0) {
         // Nothing survived; writing an empty list would hand the route back to
@@ -729,16 +789,46 @@ export function apply(ctx, config = {}) {
                 `随之不再自动注入 x-opencode-session 请求头。若你的网关要求该头（如 OpenCode Go），请同时在路由里显式配置 headers。`),
         )
       }
+      // Everything lands in ONE mutate so a refused companion route cannot leave
+      // the main route half-written.
+      const ops = []
       if (changed) {
-        setStatus('writing', `写入 settings（${writable.length} 个模型）…`)
+        // A route that declares `api` but omits baseURL is refused by dsh for any
+        // undescribed model ("needs a baseURL"). The plugin knows the endpoint,
+        // so it completes the route in the same write rather than failing.
+        ops.push({ op: 'set', path: ['providers', provider, 'models'], value: writable })
+        if ((typeof route.baseURL !== 'string' || route.baseURL.length === 0) && defaults.baseURL) {
+          ops.push({ op: 'set', path: ['providers', provider, 'baseURL'], value: defaults.baseURL })
+        }
+      }
+      const extraReport = []
+      for (const [name, group] of extraGroups) {
+        // Preserve hand-edited entries by id, exactly like the main route does.
+        const before = Array.isArray(section.providers?.[name]?.models) ? section.providers[name].models : []
+        const beforeById = new Map(before.filter((m) => m && typeof m.id === 'string').map((m) => [m.id, m]))
+        const merged = group.models.map((model) => ({ ...(beforeById.get(model.id) ?? {}), ...model }))
+        const same = JSON.stringify(before) === JSON.stringify(merged)
+        const routeValue = {
+          api: group.protocol,
+          baseURL,
+          apiKeyEnv: keyEnv,
+          ...(Object.keys(group.headers).length > 0 ? { headers: group.headers } : {}),
+          models: merged,
+        }
+        if (!same || section.providers?.[name] === undefined) {
+          ops.push({ op: 'set', path: ['providers', name], value: routeValue })
+        }
+        if (group.models.length > 0) {
+          extraReport.push({
+            provider: name,
+            protocol: group.protocol,
+            models: group.models.map((model) => model.id),
+          })
+        }
+      }
+      if (ops.length > 0) {
+        setStatus('writing', `写入 settings（主路由 ${writable.length} 个模型${extraReport.length > 0 ? `，另有 ${extraReport.length} 条扩展路由` : ''}）…`)
         try {
-          // A route that declares `api` but omits baseURL is refused by dsh for any
-          // undescribed model ("needs a baseURL"). The plugin knows the endpoint,
-          // so it completes the route in the same write rather than failing.
-          const ops = [{ op: 'set', path: ['providers', provider, 'models'], value: writable }]
-          if ((typeof route.baseURL !== 'string' || route.baseURL.length === 0) && defaults.baseURL) {
-            ops.push({ op: 'set', path: ['providers', provider, 'baseURL'], value: defaults.baseURL })
-          }
           await ctx.settings.mutate(ns, ops)
         } catch (error) {
           const message = String(error && error.message ? error.message : error)
@@ -780,26 +870,30 @@ export function apply(ctx, config = {}) {
       // filter narrows `writable`, so an undescribed model was listed as BOTH
       // 新增 and 未纳入 — the same 8 models in two groups, under a
       // "本次配置 28 个" that was really 20. Counts must match the write.
-      const writtenIds = new Set(writable.map((model) => model.id))
-      state.detail = `完成：共 ${listed.length}，写入 ${writable.length} 个`
+      const extraIds = new Set(extraReport.flatMap((group) => group.models))
+      const writtenIds = new Set([...writable.map((model) => model.id), ...extraIds])
+      state.detail = `完成：共 ${listed.length}，写入 ${writable.length}${extraIds.size > 0 ? ` + 扩展路由 ${extraIds.size}` : ''} 个`
       state.finishedAt = Date.now()
       state.result = {
         serverCount: listed.length,
         configuredCount: writable.length,
+        extraCount: extraIds.size,
+        extraRoutes: extraReport,
         createdRoute,
         added: added.filter((id) => writtenIds.has(id)),
         kept: kept.filter((id) => writtenIds.has(id)),
         removed,
         unavailable,
-        // Models the server offers but this route cannot serve, because the
-        // installed catalog does not describe them and the route names no
-        // protocol. Surfaced rather than dropped silently: the sync still
-        // lands everything else, and the user can admit these by adding `api`.
-        skipped: undescribed.map((model) => ({
-          id: model.id,
-          reason: 'catalog 未收录，且路由未声明 api',
-        })),
-        written: changed,
+        // Catalog-undescribed models that STILL could not be placed: only a
+        // protocol this build has no companion route for. Normally empty, since
+        // they now go to their own per-protocol route instead of being dropped.
+        skipped: undescribed
+          .filter((model) => !extraIds.has(model.id))
+          .map((model) => ({
+            id: model.id,
+            reason: 'catalog 未收录，且无法为它确定可用的 wire 协议',
+          })),
+        written: ops.length > 0,
       }
     } catch (error) {
       state.phase = 'error'
