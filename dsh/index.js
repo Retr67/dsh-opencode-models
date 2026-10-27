@@ -103,6 +103,47 @@ const PROVIDER_DEFAULTS = {
   },
 }
 
+/**
+ * How much of a model's context window may be reserved for OUTPUT.
+ *
+ * dsh sizes each request as `max_tokens = min(model.maxTokens, contextWindow −
+ * estimatedPrompt)`. When `maxTokens` is close to the window that expression
+ * fills the window EXACTLY, leaving no reserve — and the estimate behind
+ * `estimatedPrompt` counts the text but not what images really cost. An
+ * image-heavy session therefore overshoots the window, and the gateway answers
+ * `400 {"model":"<id>"}` with no explanation at all, after ~30 s of upstream
+ * work. That is not a request-shape bug, so nothing in the body hints at it.
+ *
+ * Measured 2026-10-27 against this gateway (deepseek-v4.1-flash, 1,000,000
+ * window; payload = 48 real screenshots ≈ 19.7 MB base64 + 1,018,292 chars of
+ * text ≈ 800 k real prompt tokens; 367 tools):
+ *
+ *   max_tokens  131072 → 200        150000 → 200        170000 → 200
+ *   max_tokens  200000 → 200        230000 → 400        262144 → 400
+ *   max_tokens  300000 → 400        327057 → 400  ← the value dsh picked itself
+ *
+ * So the last fifth of the window is the boundary that kept every measured case
+ * alive while still leaving an enormous budget (200 k tokens ≈ 800 KB of text).
+ * Capping only happens when the catalog figure would eat MORE than that share,
+ * so models that are already conservative are never rewritten.
+ */
+const OUTPUT_BUDGET_DIVISOR = 5
+
+/**
+ * No cap ever squeezes the output budget below this, however small the window.
+ * A fifth of a 204800-token window would be 40960 — a real cut that no
+ * measurement justifies, since the headroom has to cover the tokens images
+ * really cost (an absolute quantity, not a fraction of the window). Measured
+ * 200000-safe / 230000-fatal at a 1 M window, so a fifth is the share that
+ * survived; 131072 is the floor below which there is no evidence at all, and a
+ * model already documented at or under it is never rewritten.
+ */
+const OUTPUT_BUDGET_FLOOR = 131072
+
+/** Largest safe `max_tokens` for a model with this context window. */
+const outputCeiling = (contextWindow) =>
+  Math.max(Math.floor(contextWindow / OUTPUT_BUDGET_DIVISOR), OUTPUT_BUDGET_FLOOR)
+
 const FRIENDLY = {
   gpt: 'GPT',
   glm: 'GLM',
@@ -712,12 +753,21 @@ export function apply(ctx, config = {}) {
       // list — issue #1. Catalog-known models are now written as usual and the
       // rest are reported, so a sync is no longer all-or-nothing.
       let catalogIds = null
+      const catalogSpecs = new Map() // id → { contextWindow, maxTokens }
       try {
         const llm = ctx.get?.('llm')
         // A catalog route answers this from the installed catalog: no network.
         if (llm && typeof llm.discoverModels === 'function') {
           const rows = await llm.discoverModels(ns, { provider })
           catalogIds = new Set((rows || []).map((row) => row && row.id).filter((id) => typeof id === 'string'))
+          // Keep the real capacity figures too: the output-budget cap below needs
+          // both values for models the catalog describes, and re-deriving them
+          // from a second call would be another round of discovery for nothing.
+          for (const row of rows || []) {
+            if (row && typeof row.id === 'string') {
+              catalogSpecs.set(row.id, { contextWindow: row.contextWindow, maxTokens: row.maxTokens })
+            }
+          }
         }
       } catch { catalogIds = null } // unknown: fall back to writing everything
 
@@ -727,6 +777,28 @@ export function apply(ctx, config = {}) {
       const writable = undescribed.length > 0
         ? nextModels.filter((model) => catalogIds.has(model.id))
         : nextModels
+
+      // Leave the model some headroom instead of letting it fill the window.
+      //
+      // Catalog-described models normally inherit `maxTokens` from the installed
+      // catalog and nothing here ever touched it — which is how one session hit a
+      // wall: opencode-go documents 384000 for deepseek-v4.1-flash inside a
+      // 1000000 window, so dsh reserved `1000000 − estimate` and filled the window
+      // to the token. See OUTPUT_BUDGET_DIVISOR for the measurements. Only a
+      // figure that would exceed the ceiling is rewritten, so a conservative model
+      // keeps its catalog value and a hand-set smaller value is never raised.
+      for (const model of writable) {
+        const spec = catalogSpecs.get(model.id)
+        const context = model.contextWindow ?? spec?.contextWindow
+        const documented = spec?.maxTokens
+        if (typeof context !== 'number' || context <= 0) continue
+        if (typeof documented !== 'number' || documented <= 0) continue
+        const ceiling = outputCeiling(context)
+        if (documented <= ceiling) continue
+        if (model.maxTokens === undefined || model.maxTokens > ceiling) {
+          model.maxTokens = ceiling
+        }
+      }
 
       // Companion routes: one per protocol, carrying only catalog-undescribed
       // models. They declare an `api` (so dsh can resolve a protocol for an id it
@@ -789,11 +861,14 @@ export function apply(ctx, config = {}) {
               model.contextWindow = cap.contextWindow
             }
             // Output cap: the model's own documented figure, never larger than
-            // the context we just settled on (output can never exceed it).
+            // the context we just settled on (output can never exceed it) and
+            // never more than the headroom share — same rule as the main route,
+            // for the same reason.
             const context = model.contextWindow ?? DEFAULT_CONTEXT
             if (model.maxTokens === undefined
-              && typeof cap.maxTokens === 'number' && cap.maxTokens > 0 && cap.maxTokens <= context) {
-              model.maxTokens = cap.maxTokens
+              && typeof cap.maxTokens === 'number' && cap.maxTokens > 0) {
+              const ceiling = Math.min(context, outputCeiling(context))
+              model.maxTokens = Math.min(cap.maxTokens, ceiling)
             }
           }
         }

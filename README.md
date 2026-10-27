@@ -107,6 +107,25 @@ npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/Retr67/dsh-o
 - 确实想调大/调小时才显式写，例如 `{ id: kimi-k2.6, contextWindow: 1048576 }`；
 - 服务器 `/models` 只返回 `id`，**不提供任何规格元数据**，所以本插件不猜、也不写死规格，一律留给 dsh 的 catalog 解析。
 
+### 输出预算会留出余量（v0.5.3 起）
+
+catalog 的 `maxTokens` 不必照抄。dsh 每次请求算的是：
+
+```
+max_tokens = min(模型 maxTokens, 上下文窗口 − 估算提示词 token 数)
+```
+
+当 `maxTokens` 接近窗口时，这个式子会把窗口**填得一个 token 不剩**。而 dsh 的估算只数文字、**不数图片真正要花的 token**。于是一个截图很多的会话就会溢出窗口，网关在约 30 秒后回一个毫无信息量的 `400 {"model":"xxx"}`——请求体本身完全合法，所以从报错里什么都看不出来。
+
+所以插件现在会把**超过窗口五分之一**的 `maxTokens` 压到五分之一（且不低于 131072），给提示词留出余量。实测（`deepseek-v4.1-flash`，100 万窗口，48 张真实截图 ≈ 19.7MB base64 + 101 万字符正文 ≈ 80 万真实提示词 token）：
+
+| `max_tokens` | 结果 |
+|---|---|
+| 131072 / 150000 / 170000 / **200000** | 200 |
+| 230000 / 262144 / 300000 / **327057**（dsh 自己选的） | 400 |
+
+这条规则只**下调**、从不**上调**：catalog 给的数本来就保守、或你手填了更小的值，都不会被改写。想自己控制就显式写 `maxTokens`，插件会让它保持不变。
+
 ## 工作原理
 
 - **宿主端**（`dsh/index.js`，零依赖）：注册 `POST /opencode-models/refresh`（启动后台刷新）与 `GET /opencode-models/status`（进度/结果）两个路由；从 `llm-pi-ai` settings 读取路由配置（`baseURL` / `apiKeyEnv`），经 dsh 凭据服务解析 API Key，探测完成后用 `settings.mutate` 原子写回模型数组。
